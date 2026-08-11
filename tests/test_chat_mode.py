@@ -72,8 +72,16 @@ class ChatModeFailureRecoveryTests(unittest.TestCase):
         with patch("agent.sdk_core.ClaudeSDKClient", _FakeAsyncClient), \
              patch("builtins.input", side_effect=lambda _prompt: next(inputs)), \
              patch("agent.memory.load_memory", return_value=""), \
-             patch("agent.memory.save_memory"):
+             patch("agent.memory.save_memory"), \
+             patch("agent.task_state.start_run"), \
+             patch("agent.task_state.record_step"), \
+             patch("agent.task_state.complete_run"), \
+             patch("agent.task_state.fail_run") as fail_run:
             anyio.run(sdk_core._run_chat_async, events.append)
+
+        # The simulated CLI crash was recorded to the task ledger, not just
+        # logged to the console.
+        fail_run.assert_called_once()
 
         # The failed turn was reported, not silently swallowed or crashed on.
         self.assertTrue(any("turn failed" in e for e in events))

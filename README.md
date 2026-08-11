@@ -61,6 +61,7 @@ agent/
 ├── sdk_tools.py     wraps agent/tools/ for the Claude Agent SDK's custom-tool format
 ├── sdk_core.py      the agent loop via the Claude Agent SDK (sdk backend)
 ├── memory.py        persistent, cross-session memory for chat mode (reads/writes memory.json)
+├── task_state.py    persisted per-run step ledger, sdk backend only (reads/writes task_state.json)
 └── tools/
     ├── __init__.py         registry — touched to register a new tool for the api backend
     ├── calculator.py       the calculator tool — shared by both backends
@@ -69,10 +70,12 @@ agent/
 
 main.py             CLI entry point (--backend sdk|api, --chat for multi-turn)
 memory.json          gitignored — chat mode's saved cross-session memory (created on first --chat exit)
+task_state.json       gitignored — sdk backend's latest-run step ledger (created on first sdk-backend run)
 tests/
 ├── test_tools.py      unit tests for the tool layer (no API calls)
 ├── test_chat_mode.py  unit tests for chat-mode plumbing (no API calls)
-└── test_memory.py     unit tests for the memory store (temp file, no API calls)
+├── test_memory.py     unit tests for the memory store (temp file, no API calls)
+└── test_task_state.py unit tests for the task-state ledger (temp file, no API calls)
 ```
 
 ## How the agent loop works
@@ -119,6 +122,24 @@ account email) that was never part of the conversation, and fold it into the
 saved summary. If you'd rather it not persist that, review `memory.json`
 occasionally or delete it to reset.
 
+**Task-state ledger** (`agent/task_state.py`) — `memory.json` is a lossy,
+Claude-authored summary written once at the end of a session; it can't tell
+you what a run was actually doing if it never got that far. `task_state.py`
+instead records each *step* of the current run (one user message in, one
+answer out — one turn) as it happens: which tool was called, with what
+input, what it returned, in what order. `_process_turn` in `sdk_core.py`
+watches the SDK's message stream for `ToolUseBlock`/`ToolResultBlock` pairs
+and calls `task_state.record_step(...)` as each result arrives, so if the
+CLI subprocess dies mid-turn (`ProcessError`), the steps already completed
+are on disk, not lost with it. Only the latest run is kept — `start_run()`
+overwrites the previous one — so this answers "did the last run finish, and
+if not, where did it stop," not a full history. `main.py` checks
+`task_state.load_incomplete_run()` on startup (sdk backend only) and prints
+a note if the previous run never reached `complete_run()`. Like
+`memory.py`, this is infrastructure the agent's own code reads/writes —
+Claude never sees `task_state.json` directly, and the `api` backend doesn't
+use it.
+
 ## Running the tests
 
 ```
@@ -146,8 +167,12 @@ Nothing in `core.py`, `sdk_core.py`, or `main.py` needs to change.
 
 ## Next steps
 
-- Make chat mode more resilient to a mid-session tool/CLI failure (currently a
-  `ProcessError` partway through a session propagates out and ends it).
+- Actually resume an incomplete run from `task_state.json` instead of just
+  reporting it. `main.py` currently only surfaces "the last run stopped
+  after step N" — it doesn't feed those completed steps back to Claude to
+  pick up where it left off, which is the harder, riskier half of this
+  (reconstructing enough context to safely continue rather than repeat or
+  contradict earlier steps).
 - Bring multi-turn chat mode to the `api` backend for parity with `sdk`.
 - Once the manual loop makes sense, look at the Anthropic SDK's tool runner
   (`client.beta.messages.tool_runner`), which automates the `api` backend's loop

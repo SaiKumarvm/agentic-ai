@@ -49,6 +49,18 @@ def main() -> int:
     )
     args = parser.parse_args()
 
+    if args.backend == "sdk":
+        from agent import task_state
+
+        incomplete = task_state.load_incomplete_run()
+        if incomplete:
+            steps_done = len(incomplete.get("steps", []))
+            print(
+                f"Note: a previous run ({incomplete.get('status')}) stopped after "
+                f"{steps_done} step(s) and never finished — task was: "
+                f"{incomplete.get('task')!r}\n"
+            )
+
     if args.chat:
         if args.backend != "sdk":
             print("Chat mode is only available with the sdk backend.")

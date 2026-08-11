@@ -28,10 +28,12 @@ from claude_agent_sdk import (
     ProcessError,
     ResultMessage,
     TextBlock,
+    ToolResultBlock,
     ToolUseBlock,
+    UserMessage,
 )
 
-from . import memory
+from . import memory, task_state
 from .sdk_tools import ALLOWED_TOOL_NAMES, MCP_SERVER_NAME, SERVER
 
 SYSTEM_PROMPT = (
@@ -49,6 +51,56 @@ class AgentSDKError(Exception):
     """Raised when the Claude Agent SDK / underlying CLI fails to complete a task."""
 
 
+def _tool_result_text(content) -> str:
+    """Flatten a ToolResultBlock's content (str | list[dict] | None) into
+    the plain string task_state.record_step wants to persist."""
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    parts = [block.get("text", "") for block in content if isinstance(block, dict)]
+    return "\n".join(p for p in parts if p)
+
+
+async def _process_turn(client: ClaudeSDKClient, on_event) -> tuple[str, str | None]:
+    """Drain one turn's response stream: log text/tool-call events, record
+    each completed tool call to task_state as its result arrives, and
+    return (final_text, error_message).
+
+    error_message is None on success. If the turn's ResultMessage reports
+    is_error, error_message holds the reason and the failure has already
+    been recorded via task_state.fail_run — callers decide whether that
+    should raise (single-shot) or just be reported (chat mode, so one bad
+    turn doesn't end the session).
+    """
+    pending_tool_calls: dict[str, tuple[str, dict]] = {}
+    final_text = ""
+    async for message in client.receive_response():
+        if isinstance(message, AssistantMessage):
+            for block in message.content:
+                if isinstance(block, TextBlock) and block.text:
+                    on_event(f"Claude: {block.text}")
+                    final_text = block.text
+                elif isinstance(block, ToolUseBlock):
+                    on_event(f"[tool call] {block.name}({block.input})")
+                    pending_tool_calls[block.id] = (block.name, block.input)
+        elif isinstance(message, UserMessage) and isinstance(message.content, list):
+            for block in message.content:
+                if isinstance(block, ToolResultBlock):
+                    name, tool_input = pending_tool_calls.pop(block.tool_use_id, ("unknown", {}))
+                    task_state.record_step(
+                        name, tool_input, _tool_result_text(block.content), bool(block.is_error)
+                    )
+        elif isinstance(message, ResultMessage):
+            if message.is_error:
+                reason = message.result or "The agent run ended in an error."
+                task_state.fail_run(reason)
+                return final_text, reason
+            if message.result:
+                final_text = message.result
+    return final_text, None
+
+
 async def _run_agent_async(user_message: str, on_event) -> str:
     options = ClaudeAgentOptions(
         system_prompt=SYSTEM_PROMPT,
@@ -57,23 +109,14 @@ async def _run_agent_async(user_message: str, on_event) -> str:
         allowed_tools=ALLOWED_TOOL_NAMES,  # pre-approve our one tool; no permission prompt
     )
 
-    final_text = ""
+    task_state.start_run(user_message)
     async with ClaudeSDKClient(options=options) as client:
         await client.query(user_message)
-        async for message in client.receive_response():
-            if isinstance(message, AssistantMessage):
-                for block in message.content:
-                    if isinstance(block, TextBlock) and block.text:
-                        on_event(f"Claude: {block.text}")
-                        final_text = block.text
-                    elif isinstance(block, ToolUseBlock):
-                        on_event(f"[tool call] {block.name}({block.input})")
-            elif isinstance(message, ResultMessage):
-                if message.is_error:
-                    raise AgentSDKError(message.result or "The agent run ended in an error.")
-                if message.result:
-                    final_text = message.result
+        final_text, error = await _process_turn(client, on_event)
 
+    if error:
+        raise AgentSDKError(error)
+    task_state.complete_run(final_text)
     return final_text
 
 
@@ -82,11 +125,13 @@ def run_agent_sdk(user_message: str, on_event=print) -> str:
     try:
         return anyio.run(_run_agent_async, user_message, on_event)
     except CLINotFoundError as e:
+        task_state.fail_run(f"Could not find the Claude Code CLI ('claude'): {e}")
         raise AgentSDKError(
             "Could not find the Claude Code CLI ('claude'). It must be installed "
             "and on PATH, and already logged in."
         ) from e
     except ProcessError as e:
+        task_state.fail_run(f"The Claude Code process failed: {e}")
         raise AgentSDKError(f"The Claude Code process failed: {e}") from e
 
 
@@ -159,21 +204,20 @@ async def _run_chat_async(on_event) -> None:
                     return
 
                 had_a_turn = True
+                task_state.start_run(user_message)
                 try:
                     await client.query(user_message)
-                    async for message in client.receive_response():
-                        if isinstance(message, AssistantMessage):
-                            for block in message.content:
-                                if isinstance(block, TextBlock) and block.text:
-                                    on_event(f"Claude: {block.text}")
-                                elif isinstance(block, ToolUseBlock):
-                                    on_event(f"[tool call] {block.name}({block.input})")
-                        elif isinstance(message, ResultMessage) and message.is_error:
-                            on_event(f"Agent error: {message.result or 'The agent run ended in an error.'}")
+                    final_text, error = await _process_turn(client, on_event)
+                    if error:
+                        on_event(f"Agent error: {error}")
+                    else:
+                        task_state.complete_run(final_text)
                 except (ProcessError, CLINotFoundError) as e:
                     # A CLI/process failure on this turn shouldn't end the whole
                     # session — report it and go back to prompting, so earlier
-                    # turns (and the eventual memory save) aren't lost.
+                    # turns (and the eventual memory save) aren't lost. Whatever
+                    # steps task_state recorded before the crash survive on disk.
+                    task_state.fail_run(str(e))
                     on_event(
                         f"[turn failed: {e}] That turn hit a CLI/process error and "
                         "was skipped. The session is still open — try again."

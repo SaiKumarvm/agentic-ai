@@ -3,3 +3,4 @@ __pycache__/
 *.pyc
 .env
 memory.json
+task_state.json
