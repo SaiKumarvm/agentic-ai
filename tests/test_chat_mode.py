@@ -14,7 +14,7 @@ import unittest
 from unittest.mock import patch
 
 import anyio
-from claude_agent_sdk import ProcessError
+from claude_agent_sdk import ProcessError, ResultMessage
 
 from agent import sdk_core
 from agent.sdk_core import EXIT_COMMANDS, run_agent_chat_sdk
@@ -95,6 +95,107 @@ class ChatModeFailureRecoveryTests(unittest.TestCase):
         # run — the failure didn't tear down and recreate the session,
         # i.e. conversation state (the open client) was preserved.
         self.assertEqual(_FakeAsyncClient.enter_count, 1)
+
+
+class _FakeResumeClient:
+    """Stands in for ClaudeSDKClient for resume-wiring tests. Records the
+    options it was constructed with (so tests can assert `resume=` was set)
+    and returns one clean turn — no tool calls — whose ResultMessage carries
+    a session_id, so `_process_turn`'s task_state.set_session_id call can be
+    exercised without a live CLI.
+    """
+
+    instances: list["_FakeResumeClient"] = []
+
+    def __init__(self, options=None):
+        self.options = options
+        self.query_calls = []
+        type(self).instances.append(self)
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+    async def query(self, message):
+        self.query_calls.append(message)
+
+    async def receive_response(self):
+        yield ResultMessage(
+            subtype="success",
+            duration_ms=1,
+            duration_api_ms=1,
+            is_error=False,
+            num_turns=1,
+            session_id="sess-resume-123",
+            result="42",
+        )
+
+
+class ResumeWiringTests(unittest.TestCase):
+    def setUp(self):
+        _FakeResumeClient.instances = []
+
+    def test_run_agent_sdk_resume_sets_resume_option_and_reactivates_the_ledger(self):
+        with patch("agent.sdk_core.ClaudeSDKClient", _FakeResumeClient), \
+             patch("agent.task_state.reactivate_run") as reactivate_run, \
+             patch("agent.task_state.start_run") as start_run, \
+             patch("agent.task_state.set_session_id") as set_session_id, \
+             patch("agent.task_state.complete_run"):
+            sdk_core.run_agent_sdk("continue please", resume_session_id="sess-resume-123")
+
+        self.assertEqual(_FakeResumeClient.instances[0].options.resume, "sess-resume-123")
+        reactivate_run.assert_called_once()
+        start_run.assert_not_called()
+        set_session_id.assert_called_once_with("sess-resume-123")
+
+    def test_run_agent_sdk_without_resume_starts_a_fresh_run_as_before(self):
+        with patch("agent.sdk_core.ClaudeSDKClient", _FakeResumeClient), \
+             patch("agent.task_state.reactivate_run") as reactivate_run, \
+             patch("agent.task_state.start_run") as start_run, \
+             patch("agent.task_state.set_session_id"), \
+             patch("agent.task_state.complete_run"):
+            sdk_core.run_agent_sdk("a fresh task")
+
+        self.assertIsNone(_FakeResumeClient.instances[0].options.resume)
+        start_run.assert_called_once_with("a fresh task")
+        reactivate_run.assert_not_called()
+
+    def test_run_chat_sdk_resume_sends_one_continuation_query_before_prompting(self):
+        inputs = iter(["exit"])
+        with patch("agent.sdk_core.ClaudeSDKClient", _FakeResumeClient), \
+             patch("builtins.input", side_effect=lambda _prompt: next(inputs)), \
+             patch("agent.memory.load_memory", return_value=""), \
+             patch("agent.memory.save_memory"), \
+             patch("agent.task_state.reactivate_run") as reactivate_run, \
+             patch("agent.task_state.set_session_id"), \
+             patch("agent.task_state.complete_run"):
+            run_agent_chat_sdk(resume_session_id="sess-resume-123", resume_task="what is 2+2?")
+
+        client = _FakeResumeClient.instances[0]
+        self.assertEqual(client.options.resume, "sess-resume-123")
+        reactivate_run.assert_called_once()
+        # The first query sent was the automatic continuation, before the
+        # interactive loop even asked for input (the "exit" that followed).
+        # A second query follows at session end — that's the unrelated
+        # end-of-session memory-summary prompt (had_a_turn is now True).
+        self.assertGreaterEqual(len(client.query_calls), 1)
+        self.assertIn("Continue the task", client.query_calls[0])
+
+    def test_run_chat_sdk_without_resume_leaves_resume_option_unset(self):
+        inputs = iter(["exit"])
+        with patch("agent.sdk_core.ClaudeSDKClient", _FakeResumeClient), \
+             patch("builtins.input", side_effect=lambda _prompt: next(inputs)), \
+             patch("agent.memory.load_memory", return_value=""), \
+             patch("agent.memory.save_memory"), \
+             patch("agent.task_state.reactivate_run") as reactivate_run:
+            run_agent_chat_sdk()
+
+        self.assertIsNone(_FakeResumeClient.instances[0].options.resume)
+        reactivate_run.assert_not_called()
+        # No turns happened (only "exit" was typed), so no query was sent.
+        self.assertEqual(_FakeResumeClient.instances[0].query_calls, [])
 
 
 if __name__ == "__main__":

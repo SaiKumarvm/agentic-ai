@@ -35,6 +35,14 @@ to check).
    only. Context also carries across *separate* `--chat` runs: at the end of a
    session Claude summarizes what's worth remembering into a local `memory.json`
    (gitignored), which gets loaded back in the next time you start `--chat`.
+4. If the previous run didn't finish (crashed, or a `ProcessError` mid-turn),
+   pass `--resume` to be offered a chance to continue it instead of starting
+   over:
+   ```
+   python main.py --resume
+   ```
+   Works with both single-shot and `--chat`. Without `--resume`, an incomplete
+   run is only reported, never acted on.
 
 ### Optional: the `api` backend
 
@@ -68,7 +76,7 @@ agent/
     ├── get_current_time.py the clock tool — shared by both backends
     └── random_number.py    the random-integer tool — shared by both backends
 
-main.py             CLI entry point (--backend sdk|api, --chat for multi-turn)
+main.py             CLI entry point (--backend sdk|api, --chat for multi-turn, --resume to continue an incomplete run)
 memory.json          gitignored — chat mode's saved cross-session memory (created on first --chat exit)
 task_state.json       gitignored — sdk backend's latest-run step ledger (created on first sdk-backend run)
 tests/
@@ -140,6 +148,29 @@ a note if the previous run never reached `complete_run()`. Like
 Claude never sees `task_state.json` directly, and the `api` backend doesn't
 use it.
 
+**Resuming an incomplete run** (`--resume`) — every `ResultMessage` the SDK
+sends back (success or error) carries the underlying `claude` CLI's own
+session id, which `_process_turn` captures via `task_state.set_session_id(...)`.
+That id is what makes resume possible: `ClaudeAgentOptions(resume=session_id)`
+reconnects to that *exact* conversation, reloaded from the CLI's own on-disk
+transcript — Claude already remembers whatever tool calls it already made,
+rather than us reconstructing a prompt from the `steps` list by hand. Without
+`--resume`, an incomplete run is only reported, same as before. With it,
+`main.py` asks for a `y/N` confirmation before doing anything — resuming is
+opt-in twice over (the flag, then the prompt), since jumping back into an old
+conversation instead of a new task you just asked for could otherwise be a
+surprise. On confirmation, `task_state.reactivate_run()` flips the stored
+run back to `in_progress` (keeping its task/steps/session_id) so the
+continuation keeps appending to the same ledger instead of `start_run()`
+blanking it out, and a short "continue from where you left off" query is
+sent on the resumed session. If the recorded run has no `session_id` (the
+process crashed before completing even one step, so the CLI never returned a
+`ResultMessage` to capture one from), resume isn't possible and `main.py`
+says so, falling back to starting fresh. Resume also depends on the `claude`
+CLI itself still having that session's transcript on disk — if it's been
+pruned, the attempt fails like any other CLI/process error (`ProcessError`),
+which is already handled.
+
 ## Running the tests
 
 ```
@@ -167,12 +198,6 @@ Nothing in `core.py`, `sdk_core.py`, or `main.py` needs to change.
 
 ## Next steps
 
-- Actually resume an incomplete run from `task_state.json` instead of just
-  reporting it. `main.py` currently only surfaces "the last run stopped
-  after step N" — it doesn't feed those completed steps back to Claude to
-  pick up where it left off, which is the harder, riskier half of this
-  (reconstructing enough context to safely continue rather than repeat or
-  contradict earlier steps).
 - Bring multi-turn chat mode to the `api` backend for parity with `sdk`.
 - Once the manual loop makes sense, look at the Anthropic SDK's tool runner
   (`client.beta.messages.tool_runner`), which automates the `api` backend's loop

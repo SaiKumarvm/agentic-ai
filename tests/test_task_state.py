@@ -97,6 +97,47 @@ class TaskStateTests(unittest.TestCase):
         task_state.complete_run("some answer")
         self.assertIsNone(task_state.load_incomplete_run())
 
+    def test_start_run_initializes_session_id_to_none(self):
+        task_state.start_run("a task")
+        data = json.loads(task_state.TASK_STATE_FILE.read_text(encoding="utf-8"))
+        self.assertIsNone(data["session_id"])
+
+    def test_set_session_id_persists(self):
+        task_state.start_run("what is 2 + 2?")
+        task_state.set_session_id("sess-abc-123")
+
+        data = json.loads(task_state.TASK_STATE_FILE.read_text(encoding="utf-8"))
+        self.assertEqual(data["session_id"], "sess-abc-123")
+        self.assertEqual(task_state.load_incomplete_run()["session_id"], "sess-abc-123")
+
+    def test_set_session_id_with_no_file_does_not_raise(self):
+        task_state.set_session_id("sess-abc-123")
+        self.assertIsNone(task_state.load_incomplete_run())
+
+    def test_reactivate_run_flips_failed_back_to_in_progress_and_keeps_steps(self):
+        task_state.start_run("a task that will crash")
+        task_state.record_step("calculator", {"expression": "2+2"}, "4", False)
+        task_state.set_session_id("sess-abc-123")
+        task_state.fail_run("simulated CLI crash")
+
+        reactivated = task_state.reactivate_run()
+        self.assertIsNotNone(reactivated)
+        self.assertEqual(reactivated["status"], "in_progress")
+        self.assertIsNone(reactivated["failure_reason"])
+        self.assertEqual(reactivated["task"], "a task that will crash")
+        self.assertEqual(reactivated["session_id"], "sess-abc-123")
+        self.assertEqual(len(reactivated["steps"]), 1)
+
+        # record_step requires status == in_progress, so reactivation is what
+        # lets a resumed continuation append rather than being a silent no-op.
+        task_state.record_step("get_current_time", {}, "2026-08-11 12:00:00", False)
+        data = json.loads(task_state.TASK_STATE_FILE.read_text(encoding="utf-8"))
+        self.assertEqual(len(data["steps"]), 2)
+        self.assertEqual(data["steps"][1]["index"], 1)
+
+    def test_reactivate_run_with_no_file_returns_none(self):
+        self.assertIsNone(task_state.reactivate_run())
+
 
 if __name__ == "__main__":
     unittest.main()

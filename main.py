@@ -15,11 +15,18 @@ Two run modes are available:
                  agent keeps context across turns, so follow-ups like
                  "multiply that by 10" can refer to earlier results.
 
+If the previous run (sdk backend) never finished, pass --resume to be
+offered a chance to continue it in the same Claude session (with its
+completed tool calls already in context) instead of starting fresh —
+sdk backend only. Without --resume, an incomplete run is only reported,
+not acted on.
+
 Usage:
     python main.py "What is 15% of 240, plus 30?"
     python main.py --backend api "What is 15% of 240, plus 30?"
     python main.py                      (then type the task when prompted)
     python main.py --chat               (interactive multi-turn session)
+    python main.py --resume             (offers to continue an incomplete run)
 """
 
 import argparse
@@ -47,7 +54,18 @@ def main() -> int:
         action="store_true",
         help="Start an interactive multi-turn chat session (sdk backend only).",
     )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help=(
+            "If a previous run stopped incomplete, offer to resume it in the "
+            "same Claude session instead of starting fresh (sdk backend only)."
+        ),
+    )
     args = parser.parse_args()
+
+    resume_session_id = None
+    resume_task = None
 
     if args.backend == "sdk":
         from agent import task_state
@@ -60,6 +78,23 @@ def main() -> int:
                 f"{steps_done} step(s) and never finished — task was: "
                 f"{incomplete.get('task')!r}\n"
             )
+            if not args.resume:
+                print("(Run again with --resume to continue it.)\n")
+            else:
+                session_id = incomplete.get("session_id")
+                if not session_id:
+                    print(
+                        "Can't resume — no Claude session was captured for that "
+                        "run (it likely crashed before completing a step). "
+                        "Starting fresh.\n"
+                    )
+                else:
+                    choice = input("Resume this run? [y/N]: ").strip().lower()
+                    if choice in ("y", "yes"):
+                        resume_session_id = session_id
+                        resume_task = incomplete.get("task")
+                    else:
+                        print("Starting a new run instead.\n")
 
     if args.chat:
         if args.backend != "sdk":
@@ -69,22 +104,30 @@ def main() -> int:
         from agent.sdk_core import AgentSDKError, run_agent_chat_sdk
 
         try:
-            run_agent_chat_sdk()
+            run_agent_chat_sdk(resume_session_id=resume_session_id, resume_task=resume_task)
         except AgentSDKError as e:
             print(f"Agent SDK error: {e}")
             return 1
         return 0
 
-    task = " ".join(args.task) if args.task else input("Enter a task for the agent: ").strip()
-    if not task:
-        print("No task given.")
-        return 1
+    if resume_session_id:
+        # Continuing a previous run, not starting a new one — don't ask for
+        # (or require) a fresh task; the resumed session already has it.
+        task = (
+            "Continue the task from where you left off and give a final "
+            "answer, or continue using tools if more steps are needed."
+        )
+    else:
+        task = " ".join(args.task) if args.task else input("Enter a task for the agent: ").strip()
+        if not task:
+            print("No task given.")
+            return 1
 
     if args.backend == "sdk":
         from agent.sdk_core import AgentSDKError, run_agent_sdk
 
         try:
-            answer = run_agent_sdk(task)
+            answer = run_agent_sdk(task, resume_session_id=resume_session_id)
         except AgentSDKError as e:
             print(f"Agent SDK error: {e}")
             return 1

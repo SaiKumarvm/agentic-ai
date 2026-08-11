@@ -92,6 +92,10 @@ async def _process_turn(client: ClaudeSDKClient, on_event) -> tuple[str, str | N
                         name, tool_input, _tool_result_text(block.content), bool(block.is_error)
                     )
         elif isinstance(message, ResultMessage):
+            # Captured on every ResultMessage, success or error, since it's
+            # what a later process needs to resume this exact conversation
+            # via ClaudeAgentOptions(resume=...) — see task_state.set_session_id.
+            task_state.set_session_id(message.session_id)
             if message.is_error:
                 reason = message.result or "The agent run ended in an error."
                 task_state.fail_run(reason)
@@ -101,15 +105,22 @@ async def _process_turn(client: ClaudeSDKClient, on_event) -> tuple[str, str | N
     return final_text, None
 
 
-async def _run_agent_async(user_message: str, on_event) -> str:
+async def _run_agent_async(user_message: str, on_event, resume_session_id: str | None = None) -> str:
     options = ClaudeAgentOptions(
         system_prompt=SYSTEM_PROMPT,
         tools=[],  # disable every Claude Code built-in tool (Bash, Read, Write, ...)
         mcp_servers={MCP_SERVER_NAME: SERVER},
         allowed_tools=ALLOWED_TOOL_NAMES,  # pre-approve our one tool; no permission prompt
+        resume=resume_session_id,
     )
 
-    task_state.start_run(user_message)
+    if resume_session_id:
+        # Continuing a previously recorded run: keep its task/steps/session_id
+        # on the ledger and just flip it back to in_progress, rather than
+        # start_run() blanking it out for a run that isn't actually new.
+        task_state.reactivate_run()
+    else:
+        task_state.start_run(user_message)
     async with ClaudeSDKClient(options=options) as client:
         await client.query(user_message)
         final_text, error = await _process_turn(client, on_event)
@@ -120,10 +131,16 @@ async def _run_agent_async(user_message: str, on_event) -> str:
     return final_text
 
 
-def run_agent_sdk(user_message: str, on_event=print) -> str:
-    """Synchronous entry point, mirroring agent.core.run_agent's signature."""
+def run_agent_sdk(user_message: str, on_event=print, resume_session_id: str | None = None) -> str:
+    """Synchronous entry point, mirroring agent.core.run_agent's signature.
+
+    resume_session_id: if set, reconnects to that Claude CLI session (via
+    ClaudeAgentOptions(resume=...)) instead of starting a fresh one, so
+    `user_message` is answered with the prior conversation's full history —
+    including whatever tool calls already completed — already in context.
+    """
     try:
-        return anyio.run(_run_agent_async, user_message, on_event)
+        return anyio.run(_run_agent_async, user_message, on_event, resume_session_id)
     except CLINotFoundError as e:
         task_state.fail_run(f"Could not find the Claude Code CLI ('claude'): {e}")
         raise AgentSDKError(
@@ -161,13 +178,21 @@ async def _save_session_memory(client: ClaudeSDKClient, prior_memory: str, on_ev
         on_event("(Could not save memory for next time — the session ended before it could summarize.)")
 
 
-async def _run_chat_async(on_event) -> None:
+async def _run_chat_async(
+    on_event, resume_session_id: str | None = None, resume_task: str | None = None
+) -> None:
     """Multi-turn loop: one ClaudeSDKClient session stays open across turns,
     so context (including earlier tool results) persists until the user exits.
 
     Also bridges context *across* separate chat sessions: a saved summary
     from the previous session (agent/memory.py) is loaded into the system
     prompt at the start, and an updated summary is saved at the end.
+
+    resume_session_id: if set, reconnects to that Claude CLI session (via
+    ClaudeAgentOptions(resume=...)) instead of starting a fresh one, and
+    sends one continuation query before the normal input loop starts — so
+    a previously incomplete run picks up with its full prior history
+    (including completed tool calls) already in context.
     """
     prior_memory = memory.load_memory()
     system_prompt = SYSTEM_PROMPT
@@ -181,6 +206,7 @@ async def _run_chat_async(on_event) -> None:
         tools=[],
         mcp_servers={MCP_SERVER_NAME: SERVER},
         allowed_tools=ALLOWED_TOOL_NAMES,
+        resume=resume_session_id,
     )
 
     on_event("Chat mode — type 'exit' or 'quit' to end the session.")
@@ -190,6 +216,28 @@ async def _run_chat_async(on_event) -> None:
     had_a_turn = False
     async with ClaudeSDKClient(options=options) as client:
         try:
+            if resume_session_id:
+                had_a_turn = True
+                task_state.reactivate_run()
+                on_event(f"(Resuming previous task: {resume_task!r})")
+                try:
+                    await client.query(
+                        "Continue the task from where you left off and give a "
+                        "final answer, or continue using tools if more steps "
+                        "are needed."
+                    )
+                    final_text, error = await _process_turn(client, on_event)
+                    if error:
+                        on_event(f"Agent error: {error}")
+                    else:
+                        task_state.complete_run(final_text)
+                except (ProcessError, CLINotFoundError) as e:
+                    task_state.fail_run(str(e))
+                    on_event(
+                        f"[resume failed: {e}] Could not resume the previous "
+                        "session. Continuing here with a new session."
+                    )
+
             while True:
                 try:
                     user_message = input("\nYou: ").strip()
@@ -227,7 +275,9 @@ async def _run_chat_async(on_event) -> None:
                 await _save_session_memory(client, prior_memory, on_event)
 
 
-def run_agent_chat_sdk(on_event=print) -> None:
+def run_agent_chat_sdk(
+    on_event=print, resume_session_id: str | None = None, resume_task: str | None = None
+) -> None:
     """Run an interactive multi-turn chat session using the sdk backend.
 
     Unlike run_agent_sdk (one task in, one answer out, session discarded),
@@ -235,9 +285,12 @@ def run_agent_chat_sdk(on_event=print) -> None:
     follow-ups like "multiply that by 10" can refer to earlier results.
     Context also persists *across* separate runs of --chat, via
     agent/memory.py — see _run_chat_async.
+
+    resume_session_id / resume_task: passed straight through to
+    _run_chat_async to resume a previously incomplete run.
     """
     try:
-        anyio.run(_run_chat_async, on_event)
+        anyio.run(_run_chat_async, on_event, resume_session_id, resume_task)
     except CLINotFoundError as e:
         raise AgentSDKError(
             "Could not find the Claude Code CLI ('claude'). It must be installed "

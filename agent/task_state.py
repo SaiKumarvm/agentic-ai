@@ -17,6 +17,13 @@ the existing per-turn failure recovery in _run_chat_async.
 Only the latest run is kept — this is a single overwritten file, like
 memory.json, not a growing log. The goal is "did the last run finish, and if
 not, where did it stop," not a full audit trail.
+
+set_session_id() additionally records the Claude CLI's own session id for the
+run, which is what actually lets a later process resume it (see
+ClaudeAgentOptions(resume=...) usage in agent/sdk_core.py) rather than just
+report that it stopped. reactivate_run() flips a stored run back to
+in_progress so a resumed continuation keeps appending to the same ledger
+instead of start_run() blanking it out.
 """
 
 import json
@@ -60,6 +67,7 @@ def start_run(task: str) -> None:
             "steps": [],
             "final_answer": None,
             "failure_reason": None,
+            "session_id": None,
         }
     )
 
@@ -86,6 +94,22 @@ def record_step(tool: str, tool_input: dict, result: str, is_error: bool) -> Non
     _save(data)
 
 
+def set_session_id(session_id: str) -> None:
+    """Record the underlying Claude CLI session id for the current run.
+
+    The SDK returns this on every ResultMessage (success or error). Persisting
+    it is what makes a later resume possible: a fresh process can pass it back
+    as `ClaudeAgentOptions(resume=session_id)` to reload that exact
+    conversation's history from the CLI's own on-disk transcript, rather than
+    starting a blind new session. A no-op if there is no run recorded.
+    """
+    data = _load()
+    if data is None:
+        return
+    data["session_id"] = session_id
+    _save(data)
+
+
 def complete_run(final_answer: str) -> None:
     """Mark the current run completed, with its final answer."""
     data = _load()
@@ -104,6 +128,21 @@ def fail_run(reason: str) -> None:
     data["status"] = _STATUS_FAILED
     data["failure_reason"] = reason
     _save(data)
+
+
+def reactivate_run() -> dict[str, Any] | None:
+    """Flip a stored in_progress/failed run back to in_progress so a resumed
+    continuation appends to the same step ledger (via record_step/set_session_id)
+    instead of start_run() overwriting it with a blank one. Returns the
+    reactivated run's data, or None if there's nothing on disk to reactivate.
+    """
+    data = _load()
+    if data is None:
+        return None
+    data["status"] = _STATUS_IN_PROGRESS
+    data["failure_reason"] = None
+    _save(data)
+    return data
 
 
 def load_incomplete_run() -> dict[str, Any] | None:
