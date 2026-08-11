@@ -89,7 +89,11 @@ def main() -> int:
                         "Starting fresh.\n"
                     )
                 else:
-                    choice = input("Resume this run? [y/N]: ").strip().lower()
+                    try:
+                        choice = input("Resume this run? [y/N]: ").strip().lower()
+                    except (EOFError, KeyboardInterrupt):
+                        print()
+                        choice = "n"
                     if choice in ("y", "yes"):
                         resume_session_id = session_id
                         resume_task = incomplete.get("task")
@@ -118,7 +122,10 @@ def main() -> int:
             "answer, or continue using tools if more steps are needed."
         )
     else:
-        task = " ".join(args.task) if args.task else input("Enter a task for the agent: ").strip()
+        try:
+            task = " ".join(args.task) if args.task else input("Enter a task for the agent: ").strip()
+        except (EOFError, KeyboardInterrupt):
+            task = ""
         if not task:
             print("No task given.")
             return 1

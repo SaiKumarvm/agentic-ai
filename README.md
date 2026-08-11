@@ -168,8 +168,12 @@ process crashed before completing even one step, so the CLI never returned a
 `ResultMessage` to capture one from), resume isn't possible and `main.py`
 says so, falling back to starting fresh. Resume also depends on the `claude`
 CLI itself still having that session's transcript on disk — if it's been
-pruned, the attempt fails like any other CLI/process error (`ProcessError`),
-which is already handled.
+pruned, the resumed connection fails (`ProcessError`). In single-shot mode
+that surfaces as a normal `Agent SDK error` and the process exits, same as
+any other CLI/process failure. In chat mode, `_run_chat_async` catches that
+specific failure and falls back to a fresh, non-resuming session instead of
+ending the whole session over it — the stale run is recorded as failed on
+the ledger, and the chat loop continues normally from there.
 
 ## Running the tests
 
