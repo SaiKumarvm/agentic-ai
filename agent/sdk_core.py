@@ -31,6 +31,7 @@ from claude_agent_sdk import (
     ToolUseBlock,
 )
 
+from . import memory
 from .sdk_tools import ALLOWED_TOOL_NAMES, MCP_SERVER_NAME, SERVER
 
 SYSTEM_PROMPT = (
@@ -89,42 +90,88 @@ def run_agent_sdk(user_message: str, on_event=print) -> str:
         raise AgentSDKError(f"The Claude Code process failed: {e}") from e
 
 
+async def _save_session_memory(client: ClaudeSDKClient, prior_memory: str, on_event) -> None:
+    """Ask Claude (on the still-open session) to summarize what's worth
+    remembering, and persist it to disk for the next chat session.
+    """
+    prompt = (
+        "This chat session is ending. In 2-4 plain-text sentences, write an "
+        "updated memory summary of facts, results, and preferences worth "
+        "remembering next time"
+        + (" — merge this with what you already knew from before" if prior_memory else "")
+        + ". Reply with only the summary text, nothing else."
+    )
+    try:
+        await client.query(prompt)
+        summary = ""
+        async for message in client.receive_response():
+            if isinstance(message, AssistantMessage):
+                for block in message.content:
+                    if isinstance(block, TextBlock) and block.text:
+                        summary = block.text
+        if summary:
+            memory.save_memory(summary)
+            on_event(f"(Saved memory for next time: {summary})")
+    except (ProcessError, CLINotFoundError):
+        on_event("(Could not save memory for next time — the session ended before it could summarize.)")
+
+
 async def _run_chat_async(on_event) -> None:
     """Multi-turn loop: one ClaudeSDKClient session stays open across turns,
     so context (including earlier tool results) persists until the user exits.
+
+    Also bridges context *across* separate chat sessions: a saved summary
+    from the previous session (agent/memory.py) is loaded into the system
+    prompt at the start, and an updated summary is saved at the end.
     """
+    prior_memory = memory.load_memory()
+    system_prompt = SYSTEM_PROMPT
+    if prior_memory:
+        system_prompt += (
+            "\n\nContext remembered from earlier sessions with this user:\n" + prior_memory
+        )
+
     options = ClaudeAgentOptions(
-        system_prompt=SYSTEM_PROMPT,
+        system_prompt=system_prompt,
         tools=[],
         mcp_servers={MCP_SERVER_NAME: SERVER},
         allowed_tools=ALLOWED_TOOL_NAMES,
     )
 
     on_event("Chat mode — type 'exit' or 'quit' to end the session.")
+    if prior_memory:
+        on_event(f"(Remembering from before: {prior_memory})")
+
+    had_a_turn = False
     async with ClaudeSDKClient(options=options) as client:
-        while True:
-            try:
-                user_message = input("\nYou: ").strip()
-            except (EOFError, KeyboardInterrupt):
-                on_event("\nEnding chat session.")
-                return
+        try:
+            while True:
+                try:
+                    user_message = input("\nYou: ").strip()
+                except (EOFError, KeyboardInterrupt):
+                    on_event("\nEnding chat session.")
+                    return
 
-            if not user_message:
-                continue
-            if user_message.lower() in EXIT_COMMANDS:
-                on_event("Ending chat session.")
-                return
+                if not user_message:
+                    continue
+                if user_message.lower() in EXIT_COMMANDS:
+                    on_event("Ending chat session.")
+                    return
 
-            await client.query(user_message)
-            async for message in client.receive_response():
-                if isinstance(message, AssistantMessage):
-                    for block in message.content:
-                        if isinstance(block, TextBlock) and block.text:
-                            on_event(f"Claude: {block.text}")
-                        elif isinstance(block, ToolUseBlock):
-                            on_event(f"[tool call] {block.name}({block.input})")
-                elif isinstance(message, ResultMessage) and message.is_error:
-                    on_event(f"Agent error: {message.result or 'The agent run ended in an error.'}")
+                had_a_turn = True
+                await client.query(user_message)
+                async for message in client.receive_response():
+                    if isinstance(message, AssistantMessage):
+                        for block in message.content:
+                            if isinstance(block, TextBlock) and block.text:
+                                on_event(f"Claude: {block.text}")
+                            elif isinstance(block, ToolUseBlock):
+                                on_event(f"[tool call] {block.name}({block.input})")
+                    elif isinstance(message, ResultMessage) and message.is_error:
+                        on_event(f"Agent error: {message.result or 'The agent run ended in an error.'}")
+        finally:
+            if had_a_turn:
+                await _save_session_memory(client, prior_memory, on_event)
 
 
 def run_agent_chat_sdk(on_event=print) -> None:
@@ -133,6 +180,8 @@ def run_agent_chat_sdk(on_event=print) -> None:
     Unlike run_agent_sdk (one task in, one answer out, session discarded),
     this keeps a single session open across turns via input() prompts, so
     follow-ups like "multiply that by 10" can refer to earlier results.
+    Context also persists *across* separate runs of --chat, via
+    agent/memory.py — see _run_chat_async.
     """
     try:
         anyio.run(_run_chat_async, on_event)
