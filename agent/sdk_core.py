@@ -1,0 +1,145 @@
+"""Zero-cost agent loop, built on the Claude Agent SDK.
+
+Unlike agent/core.py (which calls the raw Messages API and needs a billed
+ANTHROPIC_API_KEY), this drives the already-installed, already-logged-in
+`claude` CLI as a subprocess. It runs under whatever account that CLI is
+logged into — on this machine, a Claude Pro subscription — so there's no
+API key and no billing involved.
+
+The Agent SDK owns the reasoning loop internally: send the task, Claude
+decides whether a tool is needed, the tool runs, the result goes back,
+Claude continues or answers. That's conceptually the same loop as
+agent/core.py's hand-written version — it's just the SDK's harness
+running it instead of our own `while` loop.
+
+Tool availability is deliberately locked down: `tools=[]` disables every
+Claude Code built-in tool (Bash, Read, Write, ...), and only our own
+calculator tool (registered in agent/sdk_tools.py) is made available via
+mcp_servers + allowed_tools. This keeps the milestone's scope — "the agent
+can call the one tool we gave it" — intact under this backend too.
+"""
+
+import anyio
+from claude_agent_sdk import (
+    AssistantMessage,
+    CLINotFoundError,
+    ClaudeAgentOptions,
+    ClaudeSDKClient,
+    ProcessError,
+    ResultMessage,
+    TextBlock,
+    ToolUseBlock,
+)
+
+from .sdk_tools import ALLOWED_TOOL_NAMES, MCP_SERVER_NAME, SERVER
+
+SYSTEM_PROMPT = (
+    "You are a focused task-completing agent. You have access to a few tools: "
+    "a calculator, a clock (current date/time), and a random number generator. "
+    "Use whichever ones a task calls for, in whatever order and combination "
+    "makes sense. Once you have everything you need, give a direct final answer."
+)
+
+# Typed by the user in chat mode to end the session.
+EXIT_COMMANDS = {"exit", "quit", "q"}
+
+
+class AgentSDKError(Exception):
+    """Raised when the Claude Agent SDK / underlying CLI fails to complete a task."""
+
+
+async def _run_agent_async(user_message: str, on_event) -> str:
+    options = ClaudeAgentOptions(
+        system_prompt=SYSTEM_PROMPT,
+        tools=[],  # disable every Claude Code built-in tool (Bash, Read, Write, ...)
+        mcp_servers={MCP_SERVER_NAME: SERVER},
+        allowed_tools=ALLOWED_TOOL_NAMES,  # pre-approve our one tool; no permission prompt
+    )
+
+    final_text = ""
+    async with ClaudeSDKClient(options=options) as client:
+        await client.query(user_message)
+        async for message in client.receive_response():
+            if isinstance(message, AssistantMessage):
+                for block in message.content:
+                    if isinstance(block, TextBlock) and block.text:
+                        on_event(f"Claude: {block.text}")
+                        final_text = block.text
+                    elif isinstance(block, ToolUseBlock):
+                        on_event(f"[tool call] {block.name}({block.input})")
+            elif isinstance(message, ResultMessage):
+                if message.is_error:
+                    raise AgentSDKError(message.result or "The agent run ended in an error.")
+                if message.result:
+                    final_text = message.result
+
+    return final_text
+
+
+def run_agent_sdk(user_message: str, on_event=print) -> str:
+    """Synchronous entry point, mirroring agent.core.run_agent's signature."""
+    try:
+        return anyio.run(_run_agent_async, user_message, on_event)
+    except CLINotFoundError as e:
+        raise AgentSDKError(
+            "Could not find the Claude Code CLI ('claude'). It must be installed "
+            "and on PATH, and already logged in."
+        ) from e
+    except ProcessError as e:
+        raise AgentSDKError(f"The Claude Code process failed: {e}") from e
+
+
+async def _run_chat_async(on_event) -> None:
+    """Multi-turn loop: one ClaudeSDKClient session stays open across turns,
+    so context (including earlier tool results) persists until the user exits.
+    """
+    options = ClaudeAgentOptions(
+        system_prompt=SYSTEM_PROMPT,
+        tools=[],
+        mcp_servers={MCP_SERVER_NAME: SERVER},
+        allowed_tools=ALLOWED_TOOL_NAMES,
+    )
+
+    on_event("Chat mode — type 'exit' or 'quit' to end the session.")
+    async with ClaudeSDKClient(options=options) as client:
+        while True:
+            try:
+                user_message = input("\nYou: ").strip()
+            except (EOFError, KeyboardInterrupt):
+                on_event("\nEnding chat session.")
+                return
+
+            if not user_message:
+                continue
+            if user_message.lower() in EXIT_COMMANDS:
+                on_event("Ending chat session.")
+                return
+
+            await client.query(user_message)
+            async for message in client.receive_response():
+                if isinstance(message, AssistantMessage):
+                    for block in message.content:
+                        if isinstance(block, TextBlock) and block.text:
+                            on_event(f"Claude: {block.text}")
+                        elif isinstance(block, ToolUseBlock):
+                            on_event(f"[tool call] {block.name}({block.input})")
+                elif isinstance(message, ResultMessage) and message.is_error:
+                    on_event(f"Agent error: {message.result or 'The agent run ended in an error.'}")
+
+
+def run_agent_chat_sdk(on_event=print) -> None:
+    """Run an interactive multi-turn chat session using the sdk backend.
+
+    Unlike run_agent_sdk (one task in, one answer out, session discarded),
+    this keeps a single session open across turns via input() prompts, so
+    follow-ups like "multiply that by 10" can refer to earlier results.
+    """
+    try:
+        anyio.run(_run_chat_async, on_event)
+    except CLINotFoundError as e:
+        raise AgentSDKError(
+            "Could not find the Claude Code CLI ('claude'). It must be installed "
+            "and on PATH, and already logged in."
+        ) from e
+    except ProcessError as e:
+        raise AgentSDKError(f"The Claude Code process failed: {e}") from e
