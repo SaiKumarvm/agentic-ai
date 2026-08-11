@@ -159,16 +159,25 @@ async def _run_chat_async(on_event) -> None:
                     return
 
                 had_a_turn = True
-                await client.query(user_message)
-                async for message in client.receive_response():
-                    if isinstance(message, AssistantMessage):
-                        for block in message.content:
-                            if isinstance(block, TextBlock) and block.text:
-                                on_event(f"Claude: {block.text}")
-                            elif isinstance(block, ToolUseBlock):
-                                on_event(f"[tool call] {block.name}({block.input})")
-                    elif isinstance(message, ResultMessage) and message.is_error:
-                        on_event(f"Agent error: {message.result or 'The agent run ended in an error.'}")
+                try:
+                    await client.query(user_message)
+                    async for message in client.receive_response():
+                        if isinstance(message, AssistantMessage):
+                            for block in message.content:
+                                if isinstance(block, TextBlock) and block.text:
+                                    on_event(f"Claude: {block.text}")
+                                elif isinstance(block, ToolUseBlock):
+                                    on_event(f"[tool call] {block.name}({block.input})")
+                        elif isinstance(message, ResultMessage) and message.is_error:
+                            on_event(f"Agent error: {message.result or 'The agent run ended in an error.'}")
+                except (ProcessError, CLINotFoundError) as e:
+                    # A CLI/process failure on this turn shouldn't end the whole
+                    # session — report it and go back to prompting, so earlier
+                    # turns (and the eventual memory save) aren't lost.
+                    on_event(
+                        f"[turn failed: {e}] That turn hit a CLI/process error and "
+                        "was skipped. The session is still open — try again."
+                    )
         finally:
             if had_a_turn:
                 await _save_session_memory(client, prior_memory, on_event)
