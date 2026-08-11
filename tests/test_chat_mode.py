@@ -34,7 +34,7 @@ class _FakeAsyncClient:
     """Stands in for ClaudeSDKClient. query() always succeeds; the *first*
     receive_response() raises ProcessError mid-stream (simulating the CLI
     subprocess dying during a turn), and later calls return an empty
-    response. Records every __aenter__ so tests can confirm the session
+    response. Records every connect() so tests can confirm the session
     was opened once, not re-created after the failure.
     """
 
@@ -44,12 +44,11 @@ class _FakeAsyncClient:
         self.options = options
         self.query_calls = []
 
-    async def __aenter__(self):
+    async def connect(self):
         type(self).enter_count += 1
-        return self
 
-    async def __aexit__(self, exc_type, exc, tb):
-        return False
+    async def disconnect(self):
+        pass
 
     async def query(self, message):
         self.query_calls.append(message)
@@ -112,11 +111,22 @@ class _FakeResumeClient:
         self.query_calls = []
         type(self).instances.append(self)
 
+    # run_agent_sdk (single-shot) still uses `async with ClaudeSDKClient(...)`.
     async def __aenter__(self):
+        await self.connect()
         return self
 
     async def __aexit__(self, exc_type, exc, tb):
+        await self.disconnect()
         return False
+
+    # _run_chat_async calls connect()/disconnect() directly, so it can fall
+    # back to a fresh (non-resuming) client if a resumed connect() fails.
+    async def connect(self):
+        pass
+
+    async def disconnect(self):
+        pass
 
     async def query(self, message):
         self.query_calls.append(message)
@@ -196,6 +206,91 @@ class ResumeWiringTests(unittest.TestCase):
         reactivate_run.assert_not_called()
         # No turns happened (only "exit" was typed), so no query was sent.
         self.assertEqual(_FakeResumeClient.instances[0].query_calls, [])
+
+
+class _FakeStaleResumeClient:
+    """Simulates a stale/pruned Claude CLI session: connect() fails with a
+    ProcessError whenever `resume` is set on its options, succeeds otherwise.
+    Every instance is recorded, so tests can confirm _run_chat_async falls
+    back to a second, freshly-constructed, non-resuming client rather than
+    letting the connect() failure end the whole chat session.
+    """
+
+    instances: list["_FakeStaleResumeClient"] = []
+
+    def __init__(self, options=None):
+        self.options = options
+        self.query_calls = []
+        type(self).instances.append(self)
+
+    async def connect(self):
+        if self.options.resume:
+            raise ProcessError("stale session", exit_code=1, stderr="no such session")
+
+    async def disconnect(self):
+        pass
+
+    async def query(self, message):
+        self.query_calls.append(message)
+
+    async def receive_response(self):
+        return
+        yield  # pragma: no cover - presence of yield makes this an async generator
+
+
+class StaleResumeFallbackTests(unittest.TestCase):
+    def setUp(self):
+        _FakeStaleResumeClient.instances = []
+
+    def test_a_stale_resume_session_falls_back_to_a_fresh_chat_session(self):
+        events = []
+        inputs = iter(["exit"])
+
+        with patch("agent.sdk_core.ClaudeSDKClient", _FakeStaleResumeClient), \
+             patch("builtins.input", side_effect=lambda _prompt: next(inputs)), \
+             patch("agent.memory.load_memory", return_value=""), \
+             patch("agent.memory.save_memory"), \
+             patch("agent.task_state.reactivate_run") as reactivate_run, \
+             patch("agent.task_state.fail_run") as fail_run:
+            run_agent_chat_sdk(
+                events.append, resume_session_id="stale-sess-id", resume_task="an old task"
+            )
+
+        # Two clients were constructed: the failed resume attempt, then the
+        # fresh fallback — and the fallback's options carry no resume id.
+        self.assertEqual(len(_FakeStaleResumeClient.instances), 2)
+        self.assertEqual(_FakeStaleResumeClient.instances[0].options.resume, "stale-sess-id")
+        self.assertIsNone(_FakeStaleResumeClient.instances[1].options.resume)
+
+        # The failed connect was recorded to the ledger, not silently dropped.
+        fail_run.assert_called_once()
+        # Falling back skipped the resume path entirely — no continuation
+        # query was sent, and the run was never reactivated.
+        reactivate_run.assert_not_called()
+        self.assertEqual(_FakeStaleResumeClient.instances[1].query_calls, [])
+
+        # The failure was reported, and the session still ended normally
+        # (via "exit"), not by an uncaught exception ending the process.
+        self.assertTrue(any("resume failed" in e for e in events))
+        self.assertTrue(any("Ending chat session" in e for e in events))
+
+    def test_a_connect_failure_without_resume_still_propagates_as_before(self):
+        # No fallback without a resume attempt in play — a plain startup
+        # failure (bad CLI install, etc.) should surface exactly as it
+        # always has, not be swallowed by the new stale-session handling.
+        class _FakeAlwaysFailsClient(_FakeStaleResumeClient):
+            async def connect(self):
+                raise ProcessError("no claude CLI", exit_code=1, stderr="not found")
+
+        with patch("agent.sdk_core.ClaudeSDKClient", _FakeAlwaysFailsClient), \
+             patch("agent.memory.load_memory", return_value=""), \
+             patch("agent.task_state.fail_run") as fail_run:
+            with self.assertRaises(ProcessError):
+                anyio.run(sdk_core._run_chat_async, print)
+
+        fail_run.assert_not_called()
+        # Only one connect attempt was made — no fresh fallback client.
+        self.assertEqual(len(_FakeStaleResumeClient.instances), 1)
 
 
 if __name__ == "__main__":

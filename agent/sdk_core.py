@@ -19,6 +19,8 @@ mcp_servers + allowed_tools. This keeps the milestone's scope — "the agent
 can call the one tool we gave it" — intact under this backend too.
 """
 
+from dataclasses import replace
+
 import anyio
 from claude_agent_sdk import (
     AssistantMessage,
@@ -214,65 +216,92 @@ async def _run_chat_async(
         on_event(f"(Remembering from before: {prior_memory})")
 
     had_a_turn = False
-    async with ClaudeSDKClient(options=options) as client:
-        try:
-            if resume_session_id:
-                had_a_turn = True
-                task_state.reactivate_run()
-                on_event(f"(Resuming previous task: {resume_task!r})")
-                try:
-                    await client.query(
-                        "Continue the task from where you left off and give a "
-                        "final answer, or continue using tools if more steps "
-                        "are needed."
-                    )
-                    final_text, error = await _process_turn(client, on_event)
-                    if error:
-                        on_event(f"Agent error: {error}")
-                    else:
-                        task_state.complete_run(final_text)
-                except (ProcessError, CLINotFoundError) as e:
-                    task_state.fail_run(str(e))
-                    on_event(
-                        f"[resume failed: {e}] Could not resume the previous "
-                        "session. Continuing here with a new session."
-                    )
+    client = ClaudeSDKClient(options=options)
+    try:
+        await client.connect()
+    except (ProcessError, CLINotFoundError) as e:
+        # Only a resume attempt gets a fallback here — without resume this is
+        # a genuine startup failure (bad CLI install, etc.) and should surface
+        # exactly as it always has, via the caller's own exception handling.
+        if not resume_session_id:
+            raise
+        # connect() has already cleaned up the failed subprocess/transport by
+        # this point (see claude_agent_sdk.client.connect's own except/raise),
+        # so it's safe to just build a fresh, non-resuming client here rather
+        # than propagate and end the whole chat session over a stale/pruned
+        # session id — the resumed conversation is unrecoverable, but a new
+        # one still isn't.
+        task_state.fail_run(f"Could not reconnect to the previous session: {e}")
+        on_event(
+            f"[resume failed: {e}] Could not reconnect to the previous "
+            "session (it may be stale or no longer available). Starting a "
+            "new chat session instead."
+        )
+        resume_session_id = None
+        client = ClaudeSDKClient(options=replace(options, resume=None))
+        await client.connect()
 
-            while True:
-                try:
-                    user_message = input("\nYou: ").strip()
-                except (EOFError, KeyboardInterrupt):
-                    on_event("\nEnding chat session.")
-                    return
+    try:
+        if resume_session_id:
+            had_a_turn = True
+            task_state.reactivate_run()
+            on_event(f"(Resuming previous task: {resume_task!r})")
+            try:
+                await client.query(
+                    "Continue the task from where you left off and give a "
+                    "final answer, or continue using tools if more steps "
+                    "are needed."
+                )
+                final_text, error = await _process_turn(client, on_event)
+                if error:
+                    on_event(f"Agent error: {error}")
+                else:
+                    task_state.complete_run(final_text)
+            except (ProcessError, CLINotFoundError) as e:
+                # Connection succeeded, so this is the same still-open
+                # session hitting a mid-turn error — not a new one.
+                task_state.fail_run(str(e))
+                on_event(
+                    f"[resume failed: {e}] That turn hit a CLI/process "
+                    "error. The session is still open — try again."
+                )
 
-                if not user_message:
-                    continue
-                if user_message.lower() in EXIT_COMMANDS:
-                    on_event("Ending chat session.")
-                    return
+        while True:
+            try:
+                user_message = input("\nYou: ").strip()
+            except (EOFError, KeyboardInterrupt):
+                on_event("\nEnding chat session.")
+                return
 
-                had_a_turn = True
-                task_state.start_run(user_message)
-                try:
-                    await client.query(user_message)
-                    final_text, error = await _process_turn(client, on_event)
-                    if error:
-                        on_event(f"Agent error: {error}")
-                    else:
-                        task_state.complete_run(final_text)
-                except (ProcessError, CLINotFoundError) as e:
-                    # A CLI/process failure on this turn shouldn't end the whole
-                    # session — report it and go back to prompting, so earlier
-                    # turns (and the eventual memory save) aren't lost. Whatever
-                    # steps task_state recorded before the crash survive on disk.
-                    task_state.fail_run(str(e))
-                    on_event(
-                        f"[turn failed: {e}] That turn hit a CLI/process error and "
-                        "was skipped. The session is still open — try again."
-                    )
-        finally:
-            if had_a_turn:
-                await _save_session_memory(client, prior_memory, on_event)
+            if not user_message:
+                continue
+            if user_message.lower() in EXIT_COMMANDS:
+                on_event("Ending chat session.")
+                return
+
+            had_a_turn = True
+            task_state.start_run(user_message)
+            try:
+                await client.query(user_message)
+                final_text, error = await _process_turn(client, on_event)
+                if error:
+                    on_event(f"Agent error: {error}")
+                else:
+                    task_state.complete_run(final_text)
+            except (ProcessError, CLINotFoundError) as e:
+                # A CLI/process failure on this turn shouldn't end the whole
+                # session — report it and go back to prompting, so earlier
+                # turns (and the eventual memory save) aren't lost. Whatever
+                # steps task_state recorded before the crash survive on disk.
+                task_state.fail_run(str(e))
+                on_event(
+                    f"[turn failed: {e}] That turn hit a CLI/process error and "
+                    "was skipped. The session is still open — try again."
+                )
+    finally:
+        if had_a_turn:
+            await _save_session_memory(client, prior_memory, on_event)
+        await client.disconnect()
 
 
 def run_agent_chat_sdk(
